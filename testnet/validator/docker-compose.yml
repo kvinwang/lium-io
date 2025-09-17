@@ -1,0 +1,23 @@
+services:
+  mock-validator:
+    build: .
+    container_name: testnet-validator
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      - PYTHONUNBUFFERED=1
+    ports:
+      - ${WEB_EXTERNAL_PORT}:${WEB_INTERNAL_PORT}
+    expose:
+      - ${WEB_INTERNAL_PORT}
+    volumes:
+      - ../wallets:/root/.bittensor/wallets
+      - ./ssh-keys:/data/keys
+    networks:
+      - testnet
+
+networks:
+  testnet:
+    external: true
+    name: testnet-net

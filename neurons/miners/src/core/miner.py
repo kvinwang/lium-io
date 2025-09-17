@@ -103,6 +103,14 @@ class Miner:
                         extra=get_extra_info(self.default_extra),
                     ),
                 )
+                if settings.DEBUG:
+                    logger.warning(
+                        _m(
+                            'Debug mode enabled, continuing without registered hotkey',
+                            extra=get_extra_info(self.default_extra),
+                        ),
+                    )
+                    return
                 exit()
         except Exception as e:
             logger.error(

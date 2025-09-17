@@ -1,0 +1,63 @@
+services:
+  db:
+    image: postgres:14.0-alpine
+    container_name: testnet-miner-db
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - miner_db_data:/var/lib/postgresql/data
+    networks:
+      - testnet
+
+  miner:
+    image: daturaai/compute-subnet-miner:latest
+    container_name: testnet-miner
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    ports:
+      - ${EXTERNAL_PORT}:${INTERNAL_PORT}
+    expose:
+      - ${INTERNAL_PORT}
+    volumes:
+      - ../wallets:/root/.bittensor/wallets
+      - ../../neurons/miners/src:/root/app/src
+    depends_on:
+      - db
+    networks:
+      testnet:
+        aliases:
+          - miner
+
+  connector:
+    image: daturaai/compute-subnet-miner:latest
+    container_name: testnet-miner-connector
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    command: pdm run src/connector.py
+    volumes:
+      - ../wallets:/root/.bittensor/wallets
+      - ../../neurons/miners/src:/root/app/src
+      - ../scripts/helpers:/opt/testnet/helpers
+    depends_on:
+      - db
+    networks:
+      - testnet
+
+networks:
+  testnet:
+    external: true
+    name: testnet-net
+
+volumes:
+  miner_db_data:
