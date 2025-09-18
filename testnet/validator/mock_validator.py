@@ -7,10 +7,13 @@ miner protocol messages directly as JSON objects.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,6 +27,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+try:  # Optional dependency used when verifying SGX quotes
+    import dcap_qvl
+except ImportError:  # pragma: no cover - surfaced via HTTP errors
+    dcap_qvl = None  # type: ignore[assignment]
+
 LOGGER = logging.getLogger("mock-validator")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 
@@ -36,6 +44,10 @@ RESPONSE_ACCEPT_JOB = "AcceptJobRequest"
 RESPONSE_ACCEPT_SSH = "AcceptSSHKeyRequest"
 RESPONSE_FAILED = "FailedRequest"
 RESPONSE_DECLINE = "DeclineJobRequest"
+
+DEFAULT_PCCS_URL = "https://api.trustedservices.intel.com"
+QUOTE_REPORT_PREFIX = b"dip1:inline:lium:"
+HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
 
 def _required_env(name: str) -> str:
@@ -125,6 +137,51 @@ def parse_message(raw: str) -> dict[str, Any]:
         raise ValueError(f"Malformed JSON: {exc}") from exc
 
 
+def _generate_report_data() -> tuple[str, bytes]:
+    nonce = os.urandom(20)
+    report_bytes = QUOTE_REPORT_PREFIX + nonce
+    return report_bytes.hex(), nonce
+
+
+def _coerce_quote_bytes(value: str) -> bytes:
+    token = value.strip()
+    if not token:
+        raise ValueError("Quote data empty")
+
+    hex_token = token[2:] if token.lower().startswith("0x") else token
+    if len(hex_token) % 2 == 0 and all(ch in HEX_DIGITS for ch in hex_token):
+        try:
+            return bytes.fromhex(hex_token)
+        except ValueError:
+            pass
+
+    for strict in (True, False):
+        try:
+            return base64.b64decode(token, validate=strict)
+        except (binascii.Error, ValueError):
+            continue
+
+    raise ValueError("Quote data is not valid hex or base64")
+
+
+def _decode_quote_payload(raw: bytes) -> tuple[bytes, str]:
+    if not raw:
+        raise ValueError("Empty quote response")
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("Quote response is not valid UTF-8 text")
+
+    cleaned = text.strip()
+    if not cleaned:
+        raise ValueError("Quote response contained only whitespace")
+
+    parsed = json.loads(cleaned)
+
+    return bytes.fromhex(parsed.get("quote", ""))
+
+
 @dataclass
 class RunState:
     status: str = "idle"
@@ -141,6 +198,9 @@ class RunState:
     last_update: float = field(default_factory=time.time)
     compose_history: list[dict[str, Any]] = field(default_factory=list)
     running_containers: list[dict[str, Any]] = field(default_factory=list)
+    verification_status: str | None = None
+    verification_message: str | None = None
+    verification_result: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -156,6 +216,9 @@ class RunState:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "last_update": self.last_update,
+            "verification_status": self.verification_status,
+            "verification_message": self.verification_message,
+            "verification_result": self.verification_result,
         }
 
 
@@ -184,6 +247,9 @@ class MockValidatorService:
             )
         ).expanduser()
         self.key_prefix = os.environ.get("SSH_KEY_PREFIX", "mock-validator")
+        self.pccs_url = os.environ.get("PCCS_URL") or DEFAULT_PCCS_URL
+        self.dstack_socket = os.environ.get("DSTACK_SOCKET", "/var/run/dstack.sock")
+        self.quote_timeout = float(os.environ.get("QUOTE_TIMEOUT_SECONDS", "30"))
 
         self.state = RunState()
         self.latest_payload: dict[str, Any] | None = None
@@ -218,6 +284,9 @@ class MockValidatorService:
                 last_error=None,
                 started_at=time.time(),
                 finished_at=None,
+                verification_status=None,
+                verification_message=None,
+                verification_result=None,
             )
             self._current_task = asyncio.create_task(self._execute(target_executor))
         return self.state
@@ -333,6 +402,41 @@ class MockValidatorService:
         LOGGER.info("Stored accept payload at %s", self.accept_path)
         return payload
 
+    def _update_executor_verification(
+        self,
+        executor_uuid: str,
+        verification: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        def _patch(executors: list[dict[str, Any]] | None) -> tuple[list[dict[str, Any]], bool]:
+            items: list[dict[str, Any]] = []
+            found = False
+            for entry in executors or []:
+                data = dict(entry)
+                if data.get("uuid") == executor_uuid:
+                    data = {**data, "verification": verification}
+                    found = True
+                items.append(data)
+            return items, found
+
+        payload_executors, found_payload = _patch(
+            (self.latest_payload or {}).get("executors") if self.latest_payload else None
+        )
+
+        state_executors, found_state = _patch(self.state.executors or [])
+
+        if self.latest_payload is not None and (found_payload or payload_executors):
+            self.latest_payload["executors"] = payload_executors
+            try:
+                self.accept_path.write_text(json.dumps(self.latest_payload, indent=2))
+            except Exception as exc:  # pragma: no cover - best effort persistence
+                LOGGER.warning("Failed to persist updated verification data: %s", exc)
+
+        if payload_executors:
+            return payload_executors
+        if state_executors:
+            return state_executors
+        return []
+
     def get_executor(self, executor_id: str | None = None) -> dict[str, Any]:
         if not self.latest_payload or not self.latest_payload.get("executors"):
             raise RuntimeError("No executor information available. Request SSH access first.")
@@ -424,6 +528,175 @@ class MockValidatorService:
             await self.refresh_containers(use_lock=False, silent=True)
 
             return self.state
+
+    async def verify_quote(self, executor_id: str | None = None) -> dict[str, Any]:
+        if dcap_qvl is None:
+            raise RuntimeError(
+                "dcap-qvl package is required. Install with `pip install dcap-qvl requests`."
+            )
+
+        executor = self.get_executor(executor_id)
+        executor_uuid = executor.get("uuid") or "unknown"
+        report_data_hex, nonce_bytes = _generate_report_data()
+        nonce_hex = nonce_bytes.hex()
+
+        private_key_path = self.state.private_key_path or self._last_generated_keypair[0]
+        if not private_key_path or not Path(private_key_path).exists():
+            raise RuntimeError("Private key not available. Request SSH access first.")
+
+        key_data = Path(private_key_path).read_text()
+        try:
+            pkey = asyncssh.import_private_key(key_data)
+        except Exception as exc:  # pragma: no cover - defensive
+            raise RuntimeError(f"Failed to load SSH key: {exc}") from exc
+
+        host = executor.get("address")
+        port = int(executor.get("ssh_port") or executor.get("port") or 22)
+        username = executor.get("ssh_username") or "root"
+
+        result: dict[str, Any] = {
+            "executor_uuid": executor_uuid,
+            "executor_address": host,
+            "executor_port": port,
+            "nonce": nonce_hex,
+            "report_data": report_data_hex,
+            "requested_at": time.time(),
+            "pccs_url": self.pccs_url,
+        }
+
+        self._update_state(
+            verification_status="running",
+            verification_message=f"Requesting quote from {executor_uuid}",
+            verification_result=result,
+        )
+        remote_command = (
+            f"docker run --rm -v {self.dstack_socket}:{self.dstack_socket} "
+            f"alpine/curl --unix-socket {self.dstack_socket} "
+            f"http://local/GetQuote?report_data={report_data_hex} 2>/dev/null"
+        )
+
+        try:
+            try:
+                async with asyncssh.connect(
+                    host=host,
+                    port=port,
+                    username=username,
+                    client_keys=[pkey],
+                    known_hosts=None,
+                ) as conn:
+                    self._update_state(
+                        verification_status="running",
+                        verification_message=f"Fetching quote via {host}:{port}",
+                        verification_result=result,
+                    )
+                    process = await conn.run(
+                        remote_command,
+                        check=False,
+                        timeout=self.quote_timeout,
+                        encoding=None,
+                    )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"Fetching quote timed out after {self.quote_timeout:.0f}s"
+                ) from exc
+            except (asyncssh.Error, OSError) as exc:
+                raise RuntimeError(f"Failed to run remote quote command: {exc}") from exc
+
+            if process.exit_status != 0:
+                stderr_text = (process.stderr or b"").decode("utf-8", errors="ignore").strip()
+                stdout_text = (process.stdout or b"").decode("utf-8", errors="ignore").strip()
+                error_text = stderr_text or stdout_text or f"exit code {process.exit_status}"
+                raise RuntimeError(f"Failed to fetch quote: {error_text}")
+
+            payload = (process.stdout or b"").strip()
+            try:
+                quote_bytes = _decode_quote_payload(payload)
+            except ValueError as exc:
+                raise RuntimeError(f"Failed to parse quote response: {exc}") from exc
+
+            quote_b64 = base64.b64encode(quote_bytes).decode("ascii")
+            result.update(
+                {
+                    "quote_length": len(quote_bytes),
+                    "quote_base64": quote_b64,
+                    "fetched_at": time.time(),
+                }
+            )
+
+            updated_executors = self._update_executor_verification(executor_uuid, result)
+
+            self._update_state(
+                verification_status="running",
+                verification_message="Verifying quote with DCAP QVL",
+                verification_result=result,
+                executors=updated_executors or self.state.executors,
+                executor_count=len(updated_executors) or self.state.executor_count,
+            )
+
+            try:
+                report = await dcap_qvl.get_collateral_and_verify(quote_bytes, self.pccs_url)
+            except ImportError as exc:
+                raise RuntimeError(
+                    "`requests` package is required by dcap-qvl for collateral download."
+                ) from exc
+            except Exception as exc:  # pragma: no cover - depends on external services
+                raise RuntimeError(f"Quote verification failed: {exc}") from exc
+
+            try:
+                advisories = list(report.advisory_ids() or [])
+            except Exception:  # pragma: no cover - defensive
+                advisories = []
+
+            report_payload: str | None = None
+            try:
+                report_payload = report.to_json()
+                report_details = json.loads(report_payload)
+            except Exception:  # pragma: no cover - fallback
+                report_details = report_payload or None
+
+            status_attr = getattr(report, "status", None)
+            if callable(status_attr):
+                try:
+                    status = status_attr()
+                except Exception:  # pragma: no cover - defensive
+                    status = "unknown"
+            else:
+                status = status_attr if status_attr is not None else "unknown"
+
+            result.update(
+                {
+                    "verification_status": status,
+                    "advisory_ids": advisories,
+                    "verification_report": report_details,
+                    "verified_at": time.time(),
+                }
+            )
+
+            updated_executors = self._update_executor_verification(executor_uuid, result)
+
+            self._update_state(
+                verification_status="success",
+                verification_message=f"Quote verified ({status})",
+                verification_result=result,
+                executors=updated_executors or self.state.executors,
+                executor_count=len(updated_executors) or self.state.executor_count,
+                last_error=None,
+            )
+
+            return result
+        except Exception as exc:
+            result.setdefault("error", str(exc))
+            result.setdefault("traceback", traceback.format_exc())
+            updated_executors = self._update_executor_verification(executor_uuid, result)
+            self._update_state(
+                verification_status="error",
+                verification_message=str(exc),
+                verification_result=result,
+                executors=updated_executors or self.state.executors,
+                executor_count=len(updated_executors) or self.state.executor_count,
+                last_error=str(exc),
+            )
+            raise
 
     async def deploy_compose(
         self,
@@ -664,6 +937,37 @@ async def status() -> JSONResponse:
     if service is None:
         raise HTTPException(status_code=503, detail="Service not ready")
     return JSONResponse(service.state_dict())
+
+
+@app.post("/verify_quote")
+async def verify_quote_endpoint(request: Request) -> JSONResponse:
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
+    executor_id: str | None = None
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}") from exc
+        if isinstance(payload, dict):
+            executor_id = payload.get("executor_id")
+    else:
+        executor_id = request.query_params.get("executor_id")
+
+    try:
+        verification = await service.verify_quote(executor_id or None)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # pragma: no cover - surfaced to caller
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    response_payload = {
+        "verification": verification,
+        "state": service.state.to_dict(),
+    }
+    return JSONResponse(response_payload)
 
 
 @app.post("/detect_hardware")

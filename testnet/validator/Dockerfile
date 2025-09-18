@@ -5,7 +5,13 @@ WORKDIR /opt/testnet
 COPY mock_validator.py ./mock_validator.py
 COPY templates ./templates
 
-RUN pip install --no-cache-dir uvicorn bittensor cryptography asyncssh
+RUN pip install --no-cache-dir \
+    uvicorn \
+    bittensor \
+    cryptography \
+    asyncssh \
+    dcap-qvl \
+    requests
 
 ENV PYTHONUNBUFFERED=1
 

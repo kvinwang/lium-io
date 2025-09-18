@@ -65,10 +65,15 @@
       border-radius: 10px;
       padding: 1rem;
       background: rgba(17,28,53,0.85);
+      display: grid;
+      gap: 0.75rem;
+    }
+    .executor-card-header {
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 1rem;
+      flex-wrap: wrap;
     }
     .executor-meta {
       display: grid;
@@ -91,6 +96,49 @@
     }
     button.primary:hover { background: var(--accent-hover); transform: translateY(-1px); }
     button.primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    button.outline {
+      padding: 0.45rem 1.1rem;
+      background: transparent;
+      border: 1px solid var(--accent);
+      border-radius: 999px;
+      color: var(--accent);
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s ease, transform 0.2s ease, color 0.2s ease;
+    }
+    button.outline:hover { background: rgba(56,189,248,0.12); color: var(--text); transform: translateY(-1px); }
+    button.outline:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+    .executor-verification {
+      font-size: 0.85rem;
+      color: var(--muted);
+      display: grid;
+      gap: 0.25rem;
+    }
+    .executor-verification strong {
+      color: var(--text);
+    }
+    .verification-status-badge {
+      display: inline-block;
+      padding: 0.15rem 0.6rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: rgba(56,189,248,0.12);
+      color: var(--accent);
+    }
+    .verification-status-badge.error {
+      background: rgba(248,113,113,0.12);
+      color: var(--error);
+    }
+    .verification-timestamp {
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .verification-error {
+      color: var(--error);
+      font-size: 0.85rem;
+    }
 
     .terminal {
       background: #050816;
@@ -246,6 +294,13 @@
       105: '#7e22ce',
       106: '#0f766e',
       107: '#f3f4f6',
+    };
+
+    const formatTimestamp = (value) => {
+      if (!value) return null;
+      const numeric = typeof value === 'number' ? value : Number(value);
+      if (Number.isNaN(numeric)) return null;
+      return new Date(numeric * 1000).toLocaleString();
     };
 
     const ANSI16_COLORS = [
@@ -549,6 +604,43 @@
       }
     });
 
+    const verifyExecutor = async (executor, triggerButton) => {
+      if (!executor) return;
+      const button = triggerButton;
+      const originalLabel = button.textContent;
+
+      try {
+        button.disabled = true;
+        button.textContent = 'Verifying...';
+
+        const response = await fetch('/verify_quote', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ executor_id: executor.uuid }),
+        });
+
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const message = (payload && payload.detail) || 'Verification failed';
+          alert(message);
+          return;
+        }
+
+        if (payload.state) {
+          render(payload.state);
+        }
+        if (payload.verification) {
+          console.info('Quote verification result:', payload.verification);
+        }
+      } catch (err) {
+        const message = err && err.message ? err.message : 'Verification request failed';
+        alert(message);
+      } finally {
+        button.disabled = false;
+        button.textContent = originalLabel;
+      }
+    };
+
     const renderExecutors = (executors) => {
       executorList.innerHTML = '';
       if (!executors || executors.length === 0) {
@@ -556,9 +648,17 @@
         return;
       }
 
+      const activeVerificationId =
+        latestState && latestState.verification_status === 'running' && latestState.verification_result
+          ? latestState.verification_result.executor_uuid
+          : null;
+
       executors.forEach((executor) => {
         const card = document.createElement('div');
         card.className = 'executor-card';
+
+        const header = document.createElement('div');
+        header.className = 'executor-card-header';
 
         const meta = document.createElement('div');
         meta.className = 'executor-meta';
@@ -570,15 +670,83 @@
 
         const actions = document.createElement('div');
         actions.className = 'executor-actions';
+
+        const verifyButton = document.createElement('button');
+        verifyButton.className = 'outline';
+        verifyButton.type = 'button';
+        const isActive = executor.uuid === activeVerificationId;
+        verifyButton.textContent = isActive ? 'Verifying...' : 'Verify';
+        verifyButton.disabled = Boolean(isActive);
+        verifyButton.addEventListener('click', () => verifyExecutor(executor, verifyButton));
+
         const connectButton = document.createElement('button');
         connectButton.className = 'primary';
         connectButton.textContent = 'Open Terminal';
         connectButton.type = 'button';
         connectButton.addEventListener('click', () => openTerminal(executor));
 
+        actions.appendChild(verifyButton);
         actions.appendChild(connectButton);
-        card.appendChild(meta);
-        card.appendChild(actions);
+
+        header.appendChild(meta);
+        header.appendChild(actions);
+
+        const verificationBlock = document.createElement('div');
+        verificationBlock.className = 'executor-verification';
+        const verification = executor.verification;
+
+        if (!verification) {
+          verificationBlock.textContent = 'Quote not verified yet.';
+        } else {
+          const statusLine = document.createElement('div');
+          const badge = document.createElement('span');
+          badge.className = 'verification-status-badge';
+          const statusText = (verification.verification_status || (verification.error ? 'error' : 'unknown')).toString();
+          if (statusText.toLowerCase() === 'error' || verification.error) {
+            badge.classList.add('error');
+          }
+          badge.textContent = statusText.toUpperCase();
+          statusLine.innerHTML = 'Quote status: ';
+          statusLine.appendChild(badge);
+          verificationBlock.appendChild(statusLine);
+
+          if (verification.error) {
+            const errorLine = document.createElement('div');
+            errorLine.className = 'verification-error';
+            errorLine.textContent = verification.error;
+            verificationBlock.appendChild(errorLine);
+          }
+
+          if (verification.nonce) {
+            const nonceLine = document.createElement('div');
+            const noncePreview = typeof verification.nonce === 'string'
+              ? `${verification.nonce.slice(0, 8)}...`
+              : verification.nonce;
+            nonceLine.innerHTML = `<strong>Nonce:</strong> ${noncePreview}`;
+            verificationBlock.appendChild(nonceLine);
+          }
+
+          const verifiedAt = formatTimestamp(verification.verified_at);
+          const requestedAt = formatTimestamp(verification.requested_at);
+          if (verifiedAt || requestedAt) {
+            const timeLine = document.createElement('div');
+            timeLine.className = 'verification-timestamp';
+            const parts = [];
+            if (verifiedAt) parts.push(`verified ${verifiedAt}`);
+            if (requestedAt && requestedAt !== verifiedAt) parts.push(`requested ${requestedAt}`);
+            timeLine.textContent = parts.join(' • ');
+            verificationBlock.appendChild(timeLine);
+          }
+
+          if (Array.isArray(verification.advisory_ids) && verification.advisory_ids.length > 0) {
+            const advisoriesLine = document.createElement('div');
+            advisoriesLine.innerHTML = `<strong>Advisories:</strong> ${verification.advisory_ids.join(', ')}`;
+            verificationBlock.appendChild(advisoriesLine);
+          }
+        }
+
+        card.appendChild(header);
+        card.appendChild(verificationBlock);
         executorList.appendChild(card);
       });
     };
