@@ -726,6 +726,12 @@
             verificationBlock.appendChild(nonceLine);
           }
 
+          if (verification.compose_hash) {
+            const composeLine = document.createElement('div');
+            composeLine.innerHTML = `<strong>Compose hash:</strong> ${verification.compose_hash}`;
+            verificationBlock.appendChild(composeLine);
+          }
+
           const verifiedAt = formatTimestamp(verification.verified_at);
           const requestedAt = formatTimestamp(verification.requested_at);
           if (verifiedAt || requestedAt) {

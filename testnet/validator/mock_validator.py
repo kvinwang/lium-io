@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import binascii
 import json
 import logging
 import os
@@ -47,7 +46,6 @@ RESPONSE_DECLINE = "DeclineJobRequest"
 
 DEFAULT_PCCS_URL = "https://api.trustedservices.intel.com"
 QUOTE_REPORT_PREFIX = b"dip1:inline:lium:"
-HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
 
 def _required_env(name: str) -> str:
@@ -149,37 +147,51 @@ def _coerce_quote_bytes(value: str) -> bytes:
         raise ValueError("Quote data empty")
 
     hex_token = token[2:] if token.lower().startswith("0x") else token
-    if len(hex_token) % 2 == 0 and all(ch in HEX_DIGITS for ch in hex_token):
-        try:
-            return bytes.fromhex(hex_token)
-        except ValueError:
-            pass
-
-    for strict in (True, False):
-        try:
-            return base64.b64decode(token, validate=strict)
-        except (binascii.Error, ValueError):
-            continue
-
-    raise ValueError("Quote data is not valid hex or base64")
+    try:
+        return bytes.fromhex(hex_token)
+    except ValueError as exc:
+        raise ValueError("Quote string is not valid hex") from exc
 
 
-def _decode_quote_payload(raw: bytes) -> tuple[bytes, str]:
+def _decode_quote_payload(raw: bytes) -> tuple[bytes, str, dict[str, Any], list[dict[str, Any]] | None]:
     if not raw:
         raise ValueError("Empty quote response")
 
     try:
         text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        raise ValueError("Quote response is not valid UTF-8 text")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Quote response is not valid UTF-8 text") from exc
 
     cleaned = text.strip()
     if not cleaned:
         raise ValueError("Quote response contained only whitespace")
 
-    parsed = json.loads(cleaned)
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Quote response is not valid JSON") from exc
 
-    return bytes.fromhex(parsed.get("quote", ""))
+    if not isinstance(payload, dict):
+        raise ValueError("Quote payload must be a JSON object")
+
+    quote_value = payload.get("quote")
+    if not isinstance(quote_value, str) or not quote_value.strip():
+        raise ValueError("Quote JSON payload missing 'quote' field")
+
+    quote_bytes = _coerce_quote_bytes(quote_value)
+
+    events_raw = payload.get("event_log")
+    events: list[dict[str, Any]] | None = None
+    if isinstance(events_raw, str) and events_raw.strip():
+        try:
+            parsed_events = json.loads(events_raw)
+            if isinstance(parsed_events, list):
+                # TODO: verify the event_log contents and integrity.
+                events = [entry for entry in parsed_events if isinstance(entry, dict)]
+        except json.JSONDecodeError:
+            events = None
+
+    return quote_bytes, cleaned, payload, events
 
 
 @dataclass
@@ -608,20 +620,36 @@ class MockValidatorService:
                 error_text = stderr_text or stdout_text or f"exit code {process.exit_status}"
                 raise RuntimeError(f"Failed to fetch quote: {error_text}")
 
-            payload = (process.stdout or b"").strip()
+            payload_bytes = (process.stdout or b"").strip()
             try:
-                quote_bytes = _decode_quote_payload(payload)
+                quote_bytes, quote_source, quote_payload, event_log = _decode_quote_payload(payload_bytes)
             except ValueError as exc:
                 raise RuntimeError(f"Failed to parse quote response: {exc}") from exc
+
+            compose_hash = None
+            if event_log:
+                for entry in event_log:
+                    if (
+                        entry.get("event") == "compose-hash"
+                        and isinstance(entry.get("event_payload"), str)
+                    ):
+                        compose_hash = entry["event_payload"]
+                        break
 
             quote_b64 = base64.b64encode(quote_bytes).decode("ascii")
             result.update(
                 {
                     "quote_length": len(quote_bytes),
                     "quote_base64": quote_b64,
+                    "raw_quote_source": quote_source[:512],
+                    "compose_hash": compose_hash,
                     "fetched_at": time.time(),
                 }
             )
+
+            if event_log is not None:
+                result["event_log"] = event_log
+            result["quote_payload"] = quote_payload
 
             updated_executors = self._update_executor_verification(executor_uuid, result)
 
