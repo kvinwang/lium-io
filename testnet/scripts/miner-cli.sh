@@ -11,6 +11,7 @@ Commands:
   add           Register or update an executor using the helper script
   del           Remove an executor from the local miner database
   ls            Show executor rows currently stored in the miner database
+  hotkey        Show the miner hotkey recorded in the environment
 
 Run "miner-cli.sh <command> --help" for command-specific options.
 USAGE
@@ -19,6 +20,7 @@ USAGE
 add_executor_usage() {
   cat <<'USAGE'
 Usage: miner-cli.sh add <address> <port> [price_per_hour]
+       miner-cli.sh add <address>:<port> [price_per_hour]
 
 Arguments:
   address         Executor host or IP address
@@ -48,6 +50,14 @@ Arguments:
   port         Executor port exposed to the miner
 
 Either provide --uuid or an address/port pair.
+USAGE
+}
+
+hotkey_usage() {
+  cat <<'USAGE'
+Usage: miner-cli.sh hotkey
+
+Print the SS58 miner hotkey configured in the miner environment file.
 USAGE
 }
 
@@ -120,21 +130,56 @@ add_cmd() {
   local address=$1
   shift || true
 
+  local derived_port=""
+  if [[ $address =~ ^\[[^]]+\]:[0-9]+$ ]]; then
+    derived_port=${address##*:}
+    address=${address%]:*}
+    address=${address#[}
+  else
+    local colon_only=${address//[^:]}
+    if [[ ${#colon_only} -eq 1 && $address =~ ^[^:]+:[0-9]+$ ]]; then
+      derived_port=${address##*:}
+      address=${address%:*}
+    fi
+  fi
+
   local port price
-  case $# in
-    1)
-      port=$1
-      price=${TESTNET_EXECUTOR_PRICE_PER_HOUR:-0.0}
-      ;;
-    2)
-      port=$1
-      price=$2
-      ;;
-    *)
-      add_executor_usage >&2
-      return 1
-      ;;
-  esac
+  if [[ -n $derived_port ]]; then
+    port=$derived_port
+    case $# in
+      0)
+        price=${TESTNET_EXECUTOR_PRICE_PER_HOUR:-0.0}
+        ;;
+      1)
+        price=$1
+        shift || true
+        ;;
+      *)
+        add_executor_usage >&2
+        return 1
+        ;;
+    esac
+  else
+    case $# in
+      1)
+        port=$1
+        price=${TESTNET_EXECUTOR_PRICE_PER_HOUR:-0.0}
+        ;;
+      2)
+        port=$1
+        price=$2
+        ;;
+      *)
+        add_executor_usage >&2
+        return 1
+        ;;
+    esac
+  fi
+
+  if [[ -z $address ]]; then
+    echo "Executor address is required. Pass it as an argument" >&2
+    return 1
+  fi
 
   if [[ -z $port ]]; then
     echo "Executor port is required. Pass it as an argument" >&2
@@ -253,6 +298,26 @@ del_cmd() {
   fi
 }
 
+hotkey_cmd() {
+  if [[ ${1:-} == "--help" ]]; then
+    hotkey_usage
+    return 0
+  fi
+
+  if [[ $# -gt 0 ]]; then
+    echo "hotkey does not accept any arguments" >&2
+    return 1
+  fi
+
+  local miner_hotkey=${MINER_HOTKEY_SS58:-}
+  if [[ -z $miner_hotkey ]]; then
+    echo "MINER_HOTKEY_SS58 must be set in $MINER_ENV" >&2
+    return 1
+  fi
+
+  printf 'Miner hotkey: %s\n' "$miner_hotkey"
+}
+
 main() {
   if [[ $# -eq 0 ]]; then
     usage >&2
@@ -271,6 +336,9 @@ main() {
       ;;
     ls)
       ls_cmd "$@"
+      ;;
+    hotkey)
+      hotkey_cmd "$@"
       ;;
     --help|-h)
       usage
