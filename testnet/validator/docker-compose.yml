@@ -16,6 +16,11 @@ services:
       - ./ssh-keys:/data/keys
     networks:
       - testnet
+  dstack-verifier:
+    image: kvin/dstack-verifier:latest
+    restart: unless-stopped
+    networks:
+      - testnet
 
 networks:
   testnet:

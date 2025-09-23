@@ -139,6 +139,14 @@
       color: var(--error);
       font-size: 0.85rem;
     }
+    .verification-subsection {
+      margin-top: 0.5rem;
+    }
+    .verification-subsection > strong {
+      display: block;
+      margin-bottom: 0.25rem;
+      color: var(--muted);
+    }
 
     .terminal {
       background: #050816;
@@ -355,6 +363,23 @@
         return rgbToHex(shade, shade, shade);
       }
       return null;
+    };
+
+    const createBooleanLine = (label, value) => {
+      const line = document.createElement('div');
+      const passed = Boolean(value);
+      const icon = passed ? '✓' : '✗';
+      const color = passed ? '#4ade80' : '#f87171';
+      const badge = `<span style="color:${color}; font-weight:600;">${icon} ${passed}</span>`;
+      line.innerHTML = `<strong>${label}:</strong> ${badge}`;
+      return line;
+    };
+
+    const createTextLine = (label, value) => {
+      const line = document.createElement('div');
+      const text = value === undefined || value === null ? '' : value;
+      line.innerHTML = `<strong>${label}:</strong> ${text}`;
+      return line;
     };
 
     const styleFromState = (state) => {
@@ -703,12 +728,14 @@
           const statusLine = document.createElement('div');
           const badge = document.createElement('span');
           badge.className = 'verification-status-badge';
-          const statusText = (verification.verification_status || (verification.error ? 'error' : 'unknown')).toString();
+          const statusText = (
+            verification.verification_status || (verification.error ? 'error' : 'unknown')
+          ).toString();
           if (statusText.toLowerCase() === 'error' || verification.error) {
             badge.classList.add('error');
           }
           badge.textContent = statusText.toUpperCase();
-          statusLine.innerHTML = 'Quote status: ';
+          statusLine.innerHTML = 'Quote TCB status: ';
           statusLine.appendChild(badge);
           verificationBlock.appendChild(statusLine);
 
@@ -719,19 +746,76 @@
             verificationBlock.appendChild(errorLine);
           }
 
-          if (verification.nonce) {
-            const nonceLine = document.createElement('div');
-            const noncePreview = typeof verification.nonce === 'string'
-              ? `${verification.nonce.slice(0, 8)}...`
-              : verification.nonce;
-            nonceLine.innerHTML = `<strong>Nonce:</strong> ${noncePreview}`;
-            verificationBlock.appendChild(nonceLine);
+          const checks = verification.verifier_checks;
+          if (checks && typeof checks === 'object') {
+            const testsSection = document.createElement('div');
+            testsSection.className = 'verification-subsection';
+            const header = document.createElement('strong');
+            header.textContent = 'Verification Results:';
+            testsSection.appendChild(header);
+            testsSection.appendChild(
+              createBooleanLine('Overall Valid', checks.overall_valid)
+            );
+            testsSection.appendChild(
+              createBooleanLine('Quote Verified', checks.quote_verified)
+            );
+            testsSection.appendChild(
+              createBooleanLine('Event Log Verified', checks.event_log_verified)
+            );
+            testsSection.appendChild(
+              createBooleanLine('OS Image Verified', checks.os_image_verified)
+            );
+            if (
+              Object.prototype.hasOwnProperty.call(checks, 'report_data_verified')
+            ) {
+              testsSection.appendChild(
+                createBooleanLine('Report Data Verified', checks.report_data_verified)
+              );
+            }
+            verificationBlock.appendChild(testsSection);
           }
 
-          if (verification.compose_hash) {
-            const composeLine = document.createElement('div');
-            composeLine.innerHTML = `<strong>Compose hash:</strong> ${verification.compose_hash}`;
-            verificationBlock.appendChild(composeLine);
+          if (verification.nonce) {
+            const nonceValue = typeof verification.nonce === 'string'
+              ? `${verification.nonce.slice(0, 8)}...`
+              : verification.nonce;
+            verificationBlock.appendChild(
+              createTextLine('Nonce', nonceValue)
+            );
+          }
+
+          const rawAppInfo = verification.app_info;
+          const appInfo = rawAppInfo && typeof rawAppInfo === 'object'
+            ? rawAppInfo
+            : null;
+          if (appInfo) {
+            const appSection = document.createElement('div');
+            appSection.className = 'verification-subsection';
+            const appHeader = document.createElement('strong');
+            appHeader.textContent = 'App Information:';
+            appSection.appendChild(appHeader);
+
+            const infoFields = [
+              ['App ID', appInfo.app_id],
+              ['Compose Hash', appInfo.compose_hash || verification.compose_hash],
+              ['OS Image Hash', appInfo.os_image_hash || verification.os_image_hash],
+            ];
+            infoFields.forEach(([label, value]) => {
+              if (!value) return;
+              appSection.appendChild(createTextLine(label, value));
+            });
+            verificationBlock.appendChild(appSection);
+          } else {
+            if (verification.compose_hash) {
+              verificationBlock.appendChild(
+                createTextLine('Compose Hash', verification.compose_hash)
+              );
+            }
+            if (verification.os_image_hash) {
+              verificationBlock.appendChild(
+                createTextLine('OS Image Hash', verification.os_image_hash)
+              );
+            }
           }
 
           const verifiedAt = formatTimestamp(verification.verified_at);
@@ -741,12 +825,17 @@
             timeLine.className = 'verification-timestamp';
             const parts = [];
             if (verifiedAt) parts.push(`verified ${verifiedAt}`);
-            if (requestedAt && requestedAt !== verifiedAt) parts.push(`requested ${requestedAt}`);
+            if (requestedAt && requestedAt !== verifiedAt) {
+              parts.push(`requested ${requestedAt}`);
+            }
             timeLine.textContent = parts.join(' • ');
             verificationBlock.appendChild(timeLine);
           }
 
-          if (Array.isArray(verification.advisory_ids) && verification.advisory_ids.length > 0) {
+          if (
+            Array.isArray(verification.advisory_ids) &&
+            verification.advisory_ids.length > 0
+          ) {
             const advisoriesLine = document.createElement('div');
             advisoriesLine.innerHTML = `<strong>Advisories:</strong> ${verification.advisory_ids.join(', ')}`;
             verificationBlock.appendChild(advisoriesLine);

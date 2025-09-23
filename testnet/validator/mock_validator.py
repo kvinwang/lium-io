@@ -7,7 +7,6 @@ miner protocol messages directly as JSON objects.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -17,9 +16,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import asyncssh
 import bittensor
 import websockets
-import asyncssh
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import FastAPI, HTTPException, Request
@@ -27,9 +26,9 @@ from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 try:  # Optional dependency used when verifying SGX quotes
-    import dcap_qvl
+    import httpx
 except ImportError:  # pragma: no cover - surfaced via HTTP errors
-    dcap_qvl = None  # type: ignore[assignment]
+    httpx = None  # type: ignore[assignment]
 
 LOGGER = logging.getLogger("mock-validator")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
@@ -44,7 +43,7 @@ RESPONSE_ACCEPT_SSH = "AcceptSSHKeyRequest"
 RESPONSE_FAILED = "FailedRequest"
 RESPONSE_DECLINE = "DeclineJobRequest"
 
-DEFAULT_PCCS_URL = "https://api.trustedservices.intel.com"
+DEFAULT_VERIFIER_URL = "http://dstack-verifier:8080"
 QUOTE_REPORT_PREFIX = b"dip1:inline:lium:"
 
 
@@ -141,59 +140,6 @@ def _generate_report_data() -> tuple[str, bytes]:
     return report_bytes.hex(), nonce
 
 
-def _coerce_quote_bytes(value: str) -> bytes:
-    token = value.strip()
-    if not token:
-        raise ValueError("Quote data empty")
-
-    hex_token = token[2:] if token.lower().startswith("0x") else token
-    try:
-        return bytes.fromhex(hex_token)
-    except ValueError as exc:
-        raise ValueError("Quote string is not valid hex") from exc
-
-
-def _decode_quote_payload(raw: bytes) -> tuple[bytes, str, dict[str, Any], list[dict[str, Any]] | None]:
-    if not raw:
-        raise ValueError("Empty quote response")
-
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError("Quote response is not valid UTF-8 text") from exc
-
-    cleaned = text.strip()
-    if not cleaned:
-        raise ValueError("Quote response contained only whitespace")
-
-    try:
-        payload = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        raise ValueError("Quote response is not valid JSON") from exc
-
-    if not isinstance(payload, dict):
-        raise ValueError("Quote payload must be a JSON object")
-
-    quote_value = payload.get("quote")
-    if not isinstance(quote_value, str) or not quote_value.strip():
-        raise ValueError("Quote JSON payload missing 'quote' field")
-
-    quote_bytes = _coerce_quote_bytes(quote_value)
-
-    events_raw = payload.get("event_log")
-    events: list[dict[str, Any]] | None = None
-    if isinstance(events_raw, str) and events_raw.strip():
-        try:
-            parsed_events = json.loads(events_raw)
-            if isinstance(parsed_events, list):
-                # TODO: verify the event_log contents and integrity.
-                events = [entry for entry in parsed_events if isinstance(entry, dict)]
-        except json.JSONDecodeError:
-            events = None
-
-    return quote_bytes, cleaned, payload, events
-
-
 @dataclass
 class RunState:
     status: str = "idle"
@@ -259,9 +205,10 @@ class MockValidatorService:
             )
         ).expanduser()
         self.key_prefix = os.environ.get("SSH_KEY_PREFIX", "mock-validator")
-        self.pccs_url = os.environ.get("PCCS_URL") or DEFAULT_PCCS_URL
         self.dstack_socket = os.environ.get("DSTACK_SOCKET", "/var/run/dstack.sock")
         self.quote_timeout = float(os.environ.get("QUOTE_TIMEOUT_SECONDS", "30"))
+        self.verifier_url = os.environ.get("VERIFIER_URL", DEFAULT_VERIFIER_URL)
+        self.verifier_timeout = float(os.environ.get("VERIFIER_TIMEOUT_SECONDS", "30"))
 
         self.state = RunState()
         self.latest_payload: dict[str, Any] | None = None
@@ -414,6 +361,44 @@ class MockValidatorService:
         LOGGER.info("Stored accept payload at %s", self.accept_path)
         return payload
 
+    async def _call_verifier(self, quote_json_text: str) -> dict[str, Any]:
+        if httpx is None:
+            raise RuntimeError(
+                "httpx package is required to contact dstack-verifier. Install with `pip install httpx`."
+            )
+
+        base_url = (self.verifier_url or DEFAULT_VERIFIER_URL).strip()
+        if not base_url:
+            base_url = DEFAULT_VERIFIER_URL
+        if not base_url.lower().startswith("http"):
+            base_url = f"http://{base_url}"
+        url = base_url.rstrip("/")
+        if not url.endswith("/verify"):
+            url = f"{url}/verify"
+
+        LOGGER.info("Submitting quote to dstack-verifier at %s", url)
+
+        try:
+            async with httpx.AsyncClient(timeout=self.verifier_timeout) as client:
+                response = await client.post(
+                    url,
+                    content=quote_json_text.encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+        except httpx.HTTPError as exc:  # pragma: no cover - network dependency
+            raise RuntimeError(f"Verifier request failed: {exc}") from exc
+
+        if response.status_code >= 400:
+            snippet = response.text[:200] if response.text else "<empty>"
+            raise RuntimeError(
+                f"Verifier request returned {response.status_code}: {snippet}"
+            )
+
+        try:
+            return response.json()
+        except ValueError as exc:  # pragma: no cover - defensive
+            raise RuntimeError("Verifier response was not valid JSON") from exc
+
     def _update_executor_verification(
         self,
         executor_uuid: str,
@@ -542,11 +527,6 @@ class MockValidatorService:
             return self.state
 
     async def verify_quote(self, executor_id: str | None = None) -> dict[str, Any]:
-        if dcap_qvl is None:
-            raise RuntimeError(
-                "dcap-qvl package is required. Install with `pip install dcap-qvl requests`."
-            )
-
         executor = self.get_executor(executor_id)
         executor_uuid = executor.get("uuid") or "unknown"
         report_data_hex, nonce_bytes = _generate_report_data()
@@ -573,7 +553,6 @@ class MockValidatorService:
             "nonce": nonce_hex,
             "report_data": report_data_hex,
             "requested_at": time.time(),
-            "pccs_url": self.pccs_url,
         }
 
         self._update_state(
@@ -620,95 +599,155 @@ class MockValidatorService:
                 error_text = stderr_text or stdout_text or f"exit code {process.exit_status}"
                 raise RuntimeError(f"Failed to fetch quote: {error_text}")
 
-            payload_bytes = (process.stdout or b"").strip()
-            try:
-                quote_bytes, quote_source, quote_payload, event_log = _decode_quote_payload(payload_bytes)
-            except ValueError as exc:
-                raise RuntimeError(f"Failed to parse quote response: {exc}") from exc
-
-            compose_hash = None
-            if event_log:
-                for entry in event_log:
-                    if (
-                        entry.get("event") == "compose-hash"
-                        and isinstance(entry.get("event_payload"), str)
-                    ):
-                        compose_hash = entry["event_payload"]
-                        break
-
-            quote_b64 = base64.b64encode(quote_bytes).decode("ascii")
-            result.update(
-                {
-                    "quote_length": len(quote_bytes),
-                    "quote_base64": quote_b64,
-                    "raw_quote_source": quote_source[:512],
-                    "compose_hash": compose_hash,
-                    "fetched_at": time.time(),
-                }
-            )
-
-            if event_log is not None:
-                result["event_log"] = event_log
-            result["quote_payload"] = quote_payload
-
-            updated_executors = self._update_executor_verification(executor_uuid, result)
-
-            self._update_state(
-                verification_status="running",
-                verification_message="Verifying quote with DCAP QVL",
-                verification_result=result,
-                executors=updated_executors or self.state.executors,
-                executor_count=len(updated_executors) or self.state.executor_count,
-            )
+            quote_response = (process.stdout or b"").strip()
+            if not quote_response:
+                raise RuntimeError("Quote response was empty")
 
             try:
-                report = await dcap_qvl.get_collateral_and_verify(quote_bytes, self.pccs_url)
-            except ImportError as exc:
-                raise RuntimeError(
-                    "`requests` package is required by dcap-qvl for collateral download."
-                ) from exc
-            except Exception as exc:  # pragma: no cover - depends on external services
+                quote_json_text = quote_response.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise RuntimeError("Quote response is not valid UTF-8 text") from exc
+
+            quote_json_text = quote_json_text.strip()
+            if not quote_json_text:
+                raise RuntimeError("Quote response contained only whitespace")
+
+            try:
+                verifier_response = await self._call_verifier(quote_json_text)
+            except Exception as exc:
                 raise RuntimeError(f"Quote verification failed: {exc}") from exc
 
+            details_raw = verifier_response.get("details")
+            details = details_raw if isinstance(details_raw, dict) else {}
+
+            app_info_raw = details.get("app_info")
+            app_info = app_info_raw if isinstance(app_info_raw, dict) else {}
+
+            quote_verified = bool(details.get("quote_verified"))
+            event_log_verified = bool(details.get("event_log_verified"))
+            os_image_verified = bool(
+                details.get("os_image_verified")
+                or details.get("os_image_hash_verified")
+            )
+
+            os_image_hash = (
+                (app_info.get("os_image_hash") if isinstance(app_info, dict) else None)
+                or details.get("os_image_hash")
+            )
+
+            report_data_returned = details.get("report_data")
+
             try:
-                advisories = list(report.advisory_ids() or [])
-            except Exception:  # pragma: no cover - defensive
+                expected_report_bytes = bytes.fromhex(report_data_hex)
+            except ValueError:  # pragma: no cover - defensive, generated locally
+                expected_report_bytes = None
+
+            returned_report_bytes: bytes | None = None
+            if isinstance(report_data_returned, str):
+                token = report_data_returned.strip().lower()
+                try:
+                    returned_report_bytes = bytes.fromhex(token)
+                except ValueError:
+                    returned_report_bytes = None
+
+            def _report_data_matches(
+                expected: bytes | None,
+                returned: bytes | None,
+            ) -> bool:
+                if expected is None or returned is None:
+                    return False
+                if returned == expected:
+                    return True
+                if len(returned) >= len(expected):
+                    prefix = returned[: len(expected)]
+                    suffix = returned[len(expected) :]
+                    if prefix == expected and all(byte == 0 for byte in suffix):
+                        return True
+                return False
+
+            report_data_verified = _report_data_matches(
+                expected_report_bytes,
+                returned_report_bytes,
+            )
+
+            advisories_raw = details.get("advisory_ids")
+            if isinstance(advisories_raw, list):
+                advisories = [entry for entry in advisories_raw if isinstance(entry, str)]
+            elif isinstance(advisories_raw, str):
+                advisories = [advisories_raw]
+            else:
                 advisories = []
 
-            report_payload: str | None = None
-            try:
-                report_payload = report.to_json()
-                report_details = json.loads(report_payload)
-            except Exception:  # pragma: no cover - fallback
-                report_details = report_payload or None
+            status_raw = details.get("tcb_status")
+            tcb_status = status_raw.strip() if isinstance(status_raw, str) else None
 
-            status_attr = getattr(report, "status", None)
-            if callable(status_attr):
-                try:
-                    status = status_attr()
-                except Exception:  # pragma: no cover - defensive
-                    status = "unknown"
-            else:
-                status = status_attr if status_attr is not None else "unknown"
+            reason_raw = verifier_response.get("reason")
+            reason = reason_raw.strip() if isinstance(reason_raw, str) else None
+            is_valid = bool(verifier_response.get("is_valid"))
+
+            if not report_data_verified:
+                is_valid = False
+                mismatch_reason = "Verifier report_data mismatch"
+                if isinstance(report_data_returned, str) and report_data_returned:
+                    mismatch_reason = (
+                        f"{mismatch_reason}: expected {report_data_hex}, "
+                        f"got {report_data_returned}"
+                    )
+                elif report_data_returned is None:
+                    mismatch_reason = f"{mismatch_reason}: verifier omitted report_data"
+                else:
+                    mismatch_reason = (
+                        f"{mismatch_reason}: verifier report_data not parseable"
+                    )
+                reason = mismatch_reason if not reason else f"{reason}; {mismatch_reason}"
+
+            status_label = tcb_status or ("valid" if is_valid else "error")
 
             result.update(
                 {
-                    "verification_status": status,
+                    "verification_status": status_label,
                     "advisory_ids": advisories,
-                    "verification_report": report_details,
+                    "verification_report": verifier_response,
+                    "verifier_details": details,
+                    "verifier_is_valid": is_valid,
+                    "verifier_reason": reason,
+                    "verifier_checks": {
+                        "overall_valid": is_valid,
+                        "quote_verified": quote_verified,
+                        "event_log_verified": event_log_verified,
+                        "os_image_verified": os_image_verified,
+                        "report_data_verified": report_data_verified,
+                        "tcb_status": tcb_status or ("valid" if is_valid else "unknown"),
+                    },
+                    "app_info": app_info,
+                    "compose_hash": app_info.get("compose_hash"),
+                    "report_data_returned": report_data_returned,
+                    "report_data_verified": report_data_verified,
+                    "os_image_hash": os_image_hash,
                     "verified_at": time.time(),
                 }
             )
 
+            if is_valid:
+                result.pop("error", None)
+            elif reason:
+                result["error"] = reason
+
             updated_executors = self._update_executor_verification(executor_uuid, result)
 
+            state_status = "success" if is_valid else "error"
+            message_prefix = "Quote verification passed" if is_valid else "Quote verification failed"
+            message = (
+                f"{message_prefix} ({status_label})" if status_label else message_prefix
+            )
+
             self._update_state(
-                verification_status="success",
-                verification_message=f"Quote verified ({status})",
+                verification_status=state_status,
+                verification_message=message,
                 verification_result=result,
                 executors=updated_executors or self.state.executors,
                 executor_count=len(updated_executors) or self.state.executor_count,
-                last_error=None,
+                last_error=None if is_valid else (reason or status_label),
             )
 
             return result

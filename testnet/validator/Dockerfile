@@ -10,8 +10,7 @@ RUN pip install --no-cache-dir \
     bittensor \
     cryptography \
     asyncssh \
-    dcap-qvl \
-    requests
+    httpx
 
 ENV PYTHONUNBUFFERED=1
 
