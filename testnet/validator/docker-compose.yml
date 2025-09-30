@@ -8,9 +8,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     ports:
-      - ${WEB_EXTERNAL_PORT}:${WEB_INTERNAL_PORT}
-    expose:
-      - ${WEB_INTERNAL_PORT}
+      - ${EXTERNAL_PORT}:8080
     volumes:
       - ../wallets:/root/.bittensor/wallets
       - ./ssh-keys:/data/keys
