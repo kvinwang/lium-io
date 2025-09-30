@@ -57,7 +57,7 @@ services:
 networks:
   testnet:
     external: true
-    name: testnet-net
+    name: lium-testnet
 
 volumes:
   miner_db_data:

@@ -12,7 +12,7 @@ validator (with a web UI) that target your executor at `50.145.48.92`.
   Bittensor wallet and hotkeys here before starting the services.
 
 Workflow:
-1. Create the shared docker network: `docker network create testnet-net`
+1. Create the shared docker network: `docker network create lium-testnet`
 2. Run `./testnet/scripts/generate_wallets.sh` once to create wallets and update
    env files
 3. Configure and start the miner stack (`testnet/miner`)

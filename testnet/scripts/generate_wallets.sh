@@ -31,8 +31,8 @@ run_miner() {
   "${COMPOSE_CMD[@]}" run --rm miner "$@"
 }
 
-if ! docker network inspect testnet-net >/dev/null 2>&1; then
-  docker network create testnet-net >/dev/null
+if ! docker network inspect lium-testnet >/dev/null 2>&1; then
+  docker network create lium-testnet >/dev/null
 fi
 
 COLDKEY_PUB="$WALLET_DIR/$WALLET_NAME/coldkeypub.txt"

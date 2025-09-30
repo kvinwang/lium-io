@@ -7,7 +7,7 @@ subnet miner locally while targeting your remote executor at `50.145.48.92`.
 
 1. Create a shared docker network once (both stacks join it):
    ```bash
-docker network create testnet-net
+docker network create lium-testnet
    ```
 2. Prepare a Bittensor wallet directory that both the miner and the mock
    validator will mount. The default path `../wallets` is already volume-mapped.

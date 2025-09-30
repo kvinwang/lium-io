@@ -23,4 +23,4 @@ services:
 networks:
   testnet:
     external: true
-    name: testnet-net
+    name: lium-testnet
