@@ -6,15 +6,27 @@ MINER_DIR="$TESTNET_ROOT/miner"
 VALIDATOR_DIR="$TESTNET_ROOT/validator"
 MINER_ENV="$MINER_DIR/.env"
 VALIDATOR_ENV="$VALIDATOR_DIR/.env"
+MINER_ENV_EXAMPLE="$MINER_DIR/.env.example"
+VALIDATOR_ENV_EXAMPLE="$VALIDATOR_DIR/.env.example"
 
 if [[ ! -f "$MINER_ENV" ]]; then
-  echo "Miner .env not found at $MINER_ENV" >&2
-  exit 1
+  if [[ -f "$MINER_ENV_EXAMPLE" ]]; then
+    cp "$MINER_ENV_EXAMPLE" "$MINER_ENV"
+    echo "Created miner .env from example: $MINER_ENV"
+  else
+    echo "Miner .env not found and example missing ($MINER_ENV_EXAMPLE)" >&2
+    exit 1
+  fi
 fi
 
 if [[ ! -f "$VALIDATOR_ENV" ]]; then
-  echo "Validator .env not found at $VALIDATOR_ENV" >&2
-  exit 1
+  if [[ -f "$VALIDATOR_ENV_EXAMPLE" ]]; then
+    cp "$VALIDATOR_ENV_EXAMPLE" "$VALIDATOR_ENV"
+    echo "Created validator .env from example: $VALIDATOR_ENV"
+  else
+    echo "Validator .env not found and example missing ($VALIDATOR_ENV_EXAMPLE)" >&2
+    exit 1
+  fi
 fi
 
 # shellcheck disable=SC1090
@@ -25,6 +37,8 @@ MINER_HOTKEY_NAME=${BITTENSOR_WALLET_HOTKEY_NAME:-miner_hot}
 VALIDATOR_HOTKEY_NAME=${TESTNET_VALIDATOR_HOTKEY_NAME:-validator_hot}
 WALLET_DIR=${BITTENSOR_WALLET_DIRECTORY:-$TESTNET_ROOT/wallets}
 mkdir -p "$WALLET_DIR"
+
+export MINER_HOTKEY_NAME VALIDATOR_HOTKEY_NAME
 
 COMPOSE_CMD=(docker compose -f "$MINER_DIR/docker-compose.yml")
 run_miner() {
@@ -88,6 +102,9 @@ import re
 from pathlib import Path
 
 output = os.environ["WALLET_LIST_OUTPUT"]
+miner_hotkey_name = os.environ.get("MINER_HOTKEY_NAME", "miner_hot")
+validator_hotkey_name = os.environ.get("VALIDATOR_HOTKEY_NAME", "validator_hot")
+
 match = re.search(r'(\{.*\})', output, re.S)
 if not match:
     raise SystemExit("Failed to parse wallet list output")
@@ -103,33 +120,47 @@ for hotkey in wallet.get("hotkeys", []):
     addresses[f"HOTKEY:{hotkey['name']}"] = hotkey.get("ss58_address")
 
 updates = {
-    "MINER_HOTKEY_SS58": addresses.get("HOTKEY:miner_hot"),
-    "TESTNET_VALIDATOR_HOTKEY": addresses.get("HOTKEY:validator_hot"),
+    "MINER_HOTKEY_SS58": addresses.get(f"HOTKEY:{miner_hotkey_name}"),
+    "TESTNET_VALIDATOR_HOTKEY": addresses.get(f"HOTKEY:{validator_hotkey_name}"),
 }
 
 validator_updates = {
-    "TARGET_MINER_HOTKEY": addresses.get("HOTKEY:miner_hot"),
-    "VALIDATOR_HOTKEY_SS58": addresses.get("HOTKEY:validator_hot"),
+    "TARGET_MINER_HOTKEY": addresses.get(f"HOTKEY:{miner_hotkey_name}"),
+    "VALIDATOR_HOTKEY_SS58": addresses.get(f"HOTKEY:{validator_hotkey_name}"),
 }
 
-def update_env(path_str, mapping):
+def update_env(path_str, mapping, label):
     path = Path(path_str)
     text = path.read_text()
+    changes: list[str] = []
     for key, value in mapping.items():
         if not value:
             continue
         pattern = re.compile(rf'^{key}=.*$', re.MULTILINE)
         replacement = f"{key}={value}"
-        if pattern.search(text):
-            text = pattern.sub(replacement, text)
+        match = pattern.search(text)
+        if match:
+            if match.group(0) == replacement:
+                changes.append(f"  {key}: already {value}")
+            else:
+                text = pattern.sub(replacement, text)
+                changes.append(f"  {key}: updated -> {value}")
         else:
             if not text.endswith("\n"):
                 text += "\n"
             text += replacement + "\n"
+            changes.append(f"  {key}: added -> {value}")
     path.write_text(text)
+    if changes:
+        print(f"Updated {label} ({path}):")
+        for change in changes:
+            print(change)
+    else:
+        print(f"Updated {label} ({path}): no changes")
 
-update_env(os.environ["MINER_ENV"], updates)
-update_env(os.environ["VALIDATOR_ENV"], validator_updates)
+
+update_env(os.environ["MINER_ENV"], updates, "miner .env")
+update_env(os.environ["VALIDATOR_ENV"], validator_updates, "validator .env")
 PY
 
 run_miner pdm run btcli wallet list --wallet-path /root/.bittensor/wallets
