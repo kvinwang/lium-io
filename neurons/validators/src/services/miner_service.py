@@ -103,7 +103,14 @@ class MinerService:
                 # generate ssh key and send it to miner
                 private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
-                await miner_client.send_model(SSHPubKeySubmitRequest(public_key=public_key))
+                # Validator signs the public key with purpose indicator
+                data_to_sign = f"SSH_PUBKEY_INJECTION:{public_key.decode('utf-8')}"
+                validator_signature = f"0x{my_key.sign(data_to_sign).hex()}"
+
+                await miner_client.send_model(SSHPubKeySubmitRequest(
+                    public_key=public_key,
+                    validator_signature=validator_signature
+                ))
 
                 try:
                     msg = await asyncio.wait_for(
@@ -338,9 +345,14 @@ class MinerService:
                 # generate ssh key and send it to miner
                 private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
+                # Validator signs the public key with purpose indicator
+                data_to_sign = f"SSH_PUBKEY_INJECTION:{public_key.decode('utf-8')}"
+                validator_signature = f"0x{my_key.sign(data_to_sign).hex()}"
+
                 await miner_client.send_model(
                     SSHPubKeySubmitRequest(
                         public_key=public_key,
+                        validator_signature=validator_signature,
                         executor_id=payload.executor_id,
                         is_rental_request=isinstance(payload, ContainerCreateRequest),
                     )
@@ -698,9 +710,14 @@ class MinerService:
             )
 
             async with miner_client:
+                # Validator signs the public key with purpose indicator
+                data_to_sign = f"SSH_PUBKEY_INJECTION:{payload.public_key.decode('utf-8')}"
+                validator_signature = f"0x{my_key.sign(data_to_sign).hex()}"
+
                 await miner_client.send_model(
                     SSHPubKeySubmitRequest(
                         public_key=payload.public_key,
+                        validator_signature=validator_signature,
                         executor_id=payload.executor_id,
                         is_rental_request=False,
                     )
