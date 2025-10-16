@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 class BaseConsumer(abc.ABC):
     def __init__(self, websocket: WebSocket):
         self.websocket = websocket
+        self._connected = False
 
     @abc.abstractmethod
     def accepted_request_type(self) -> type[BaseRequest]:
@@ -18,6 +19,7 @@ class BaseConsumer(abc.ABC):
 
     async def connect(self):
         await self.websocket.accept()
+        self._connected = True
 
     async def receive_message(self) -> BaseRequest:
         data = await self.websocket.receive_text()
@@ -27,6 +29,7 @@ class BaseConsumer(abc.ABC):
         await self.websocket.send_text(msg.json())
 
     async def disconnect(self):
+        self._connected = False
         try:
             await self.websocket.close()
         except Exception:
@@ -39,7 +42,7 @@ class BaseConsumer(abc.ABC):
     async def handle(self):
         # await self.connect()
         try:
-            while True:
+            while self._connected:
                 data: BaseRequest = await self.receive_message()
                 await self.handle_message(data)
         except WebSocketDisconnect as ex:
