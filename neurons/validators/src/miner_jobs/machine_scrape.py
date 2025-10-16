@@ -995,7 +995,26 @@ def _encrypt(key: str, payload: str) -> str:
     return Fernet(key_bytes).encrypt(payload.encode("utf-8")).decode("utf-8")
 
 
+KEYS_FOR_ENCRYPTION_KEY_GENERATION = [
+    "gpu.name",
+    "gpu.uuid",
+    "gpu.capacity",
+    "gpu.cuda",
+    "gpu.power_limit",
+    "gpu.graphics_speed",
+    "gpu.memory_speed",
+    "gpu.pcie",
+    "gpu.speed_pcie",
+    "gpu.utilization",
+    "gpu.memory_utilization",
+]
+
 machine_specs = get_machine_specs()
-encryption_key = "".join(machine_specs["data_gpu"]["gpu_details"][0].keys())
+gpu_details = machine_specs.get("data_gpu", {}).get("gpu_details", [])
+if gpu_details:
+    encryption_key = "".join(gpu_details[0].keys())
+else:
+    encryption_key = "".join(KEYS_FOR_ENCRYPTION_KEY_GENERATION)
+
 encoded_str = _encrypt(encryption_key, json.dumps(machine_specs))
 print(encoded_str)
