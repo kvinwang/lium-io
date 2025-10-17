@@ -26,7 +26,7 @@ python_keywords = [
     'NVML_ERROR_MEMORY', 'NVML_ERROR_UNKNOWN', 'Exception', 'wrapper', 'args', 'kwargs', 'wraps', 'sys',
     'c_char_p', 'AttributeError', '_nvmlLib_refcount', 'nvmlLib', 'CDLL', 'os', 'tempfile', 'NVMLError',
     'OSError', 'c_uint', 'byref', 'create_string_buffer', 'c_int',  'setattr', 'subprocess', 'RuntimeError', 'hashlib',
-    'iter', 'repr', 'exc', 'e', 're', 'psutil', 'shutil', 'b64encode', 'Fernet', 'json', 'machine_specs', 'hasattr', 'bool'
+    'iter', 'repr', 'exc', 'e', 're', 'psutil', 'shutil', 'b64encode', 'Fernet', 'json', 'hasattr', 'bool'
 ]
 
 
@@ -91,11 +91,9 @@ class FunctionContentObfuscator(ast.NodeTransformer):
         self.name_mapping = {**args_mapping}
 
     def visit_Name(self, node: Name):
-        if not node.id.startswith('__') and node.id not in python_keywords:
-            if node.id not in self.name_mapping:
-                self.name_mapping[node.id] = generate_random_name()
+        # Only rename if already in mapping - don't auto-generate new names
+        if node.id in self.name_mapping:
             node.id = self.name_mapping[node.id]
-
         return node
 
 
@@ -119,6 +117,12 @@ class CodeObfuscator(ast.NodeTransformer):
 class ModuleObfuscator(ast.NodeTransformer):
     def __init__(self):
         self.func_name_mapping = {}
+
+    def visit_Name(self, node: Name):
+        # Rename all Name nodes based on collected mappings
+        if node.id in self.func_name_mapping:
+            node.id = self.func_name_mapping[node.id]
+        return node
 
     def handle_class_def(self, node: ast.ClassDef):
         if node.name not in python_keywords:
@@ -166,6 +170,9 @@ class ModuleObfuscator(ast.NodeTransformer):
                 for arg in stmt.value.args:
                     if isinstance(arg, ast.Name) and arg.id in self.func_name_mapping:
                         arg.id = self.func_name_mapping[arg.id]
+
+        # Second pass: recursively visit all child nodes to rename references
+        self.generic_visit(node)
 
         random_block = random_code_block()
         if random_block:
