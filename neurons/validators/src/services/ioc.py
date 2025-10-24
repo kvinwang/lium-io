@@ -53,6 +53,7 @@ async def initiate_services():
         task_service=ioc["TaskService"],
         redis_service=ioc["RedisService"],
         port_mapping_dao=ioc["PortMappingDao"],
+        attestation_service=ioc["AttestationService"],
     )
 
 

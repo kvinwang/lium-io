@@ -12,6 +12,7 @@ from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 
 from core.config import settings
+from core.db import AsyncSessionMaker
 from core.utils import _m, context, get_extra_info, StructuredMessage
 from daos.port_mapping_dao import PortMappingDao
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
@@ -58,6 +59,8 @@ class JobResult(BaseModel):
     gpu_count: int = 0
     sysbox_runtime: bool = False
     ssh_pub_keys: list[str] | None = None
+    attestation_digest: str | None = None
+    tee_type: str | None = None
 
 
 class TaskService:
@@ -255,6 +258,8 @@ class TaskService:
         sysbox_runtime: bool = False,
         ssh_pub_keys: list[str] | None = None,
         clear_verified_job_reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
+        attestation_digest: str | None = None,
+        tee_type: str | None = None,
     ):
         logger.info(_m("Handle task result: ", extra={
             "miner_hotkey": miner_info.miner_hotkey,
@@ -315,6 +320,8 @@ class TaskService:
             gpu_count=gpu_count,
             sysbox_runtime=sysbox_runtime,
             ssh_pub_keys=ssh_pub_keys,
+            attestation_digest=attestation_digest,
+            tee_type=tee_type,
         )
 
     def check_gpu_usage(
@@ -413,16 +420,23 @@ class TaskService:
             RENTAL_SUCCEED_MACHINE_SET, executor_info.uuid
         )
 
+        # Initialize attestation digest and tee_type to None in case of early errors
+        attestation_digest = None
+        tee_type = None
+
         try:
             logger.info(_m("Start job on an executor", extra=get_extra_info(default_extra)))
 
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
 
             try:
-                known_hosts_policy = await self.attestation_service.prepare_host_policy(
-                    executor_info,
-                    miner_info.miner_hotkey,
-                )
+                # Create database session for whitelist validation
+                async with AsyncSessionMaker() as db:
+                    known_hosts_policy, attestation_digest, tee_type = await self.attestation_service.prepare_host_policy(
+                        executor_info,
+                        miner_info.miner_hotkey,
+                        db=db,
+                    )
             except AttestationError as exc:
                 log_text = _m(
                     "Attestation failed",
@@ -565,6 +579,8 @@ class TaskService:
                         verified_job_info=verified_job_info,
                         success=False,
                         clear_verified_job_info=False,
+                        attestation_digest=attestation_digest,
+                        tee_type=tee_type,
                     )
 
                 if not GPU_MODEL_RATES.get(gpu_model) or gpu_count == 0 or len(gpu_details) != gpu_count:
@@ -611,6 +627,8 @@ class TaskService:
                         verified_job_info=verified_job_info,
                         success=False,
                         clear_verified_job_info=False,
+                        attestation_digest=attestation_digest,
+                        tee_type=tee_type,
                     )
 
                 if nvidia_driver and LIB_NVIDIA_ML_DIGESTS.get(nvidia_driver) != libnvidia_ml:
@@ -638,6 +656,8 @@ class TaskService:
                         verified_job_info=verified_job_info,
                         success=False,
                         clear_verified_job_info=True,
+                        attestation_digest=attestation_digest,
+                        tee_type=tee_type,
                     )
 
                 if prev_spec and prev_spec != gpu_model_count:
@@ -663,6 +683,8 @@ class TaskService:
                         verified_job_info=verified_job_info,
                         success=False,
                         clear_verified_job_info=True,
+                        attestation_digest=attestation_digest,
+                        tee_type=tee_type,
                     )
 
                 if self.check_fingerprints_changed(prev_uuids, gpu_uuids):
@@ -688,6 +710,8 @@ class TaskService:
                         verified_job_info=verified_job_info,
                         success=False,
                         clear_verified_job_info=True,
+                        attestation_digest=attestation_digest,
+                        tee_type=tee_type,
                     )
 
                 if await self.check_banned_guids(gpu_uuids.split(',')):
@@ -713,6 +737,8 @@ class TaskService:
                         verified_job_info=verified_job_info,
                         success=False,
                         clear_verified_job_info=True,
+                        attestation_digest=attestation_digest,
+                        tee_type=tee_type,
                     )
 
                 logger.info(
@@ -743,6 +769,8 @@ class TaskService:
                         verified_job_info=verified_job_info,
                         success=False,
                         clear_verified_job_info=True,
+                        attestation_digest=attestation_digest,
+                        tee_type=tee_type,
                     )
 
                 # check rented status
@@ -782,6 +810,8 @@ class TaskService:
                             gpu_model_count=gpu_model_count,
                             clear_verified_job_info=True,
                             clear_verified_job_reason=ResetVerifiedJobReason.POD_NOT_RUNNING,
+                            attestation_digest=attestation_digest,
+                            tee_type=tee_type,
                         )
 
                     # check gpu running out side of containers
@@ -814,6 +844,8 @@ class TaskService:
                                 gpu_model_count=gpu_model_count,
                                 clear_verified_job_info=False,
                                 ssh_pub_keys=ssh_pub_keys,
+                                attestation_digest=attestation_digest,
+                                tee_type=tee_type,
                             )
 
                     # get available port count from DB (fallback to Redis)
@@ -861,6 +893,8 @@ class TaskService:
                         clear_verified_job_info=False,
                         sysbox_runtime=sysbox_runtime,
                         ssh_pub_keys=ssh_pub_keys,
+                        attestation_digest=attestation_digest,
+                        tee_type=tee_type,
                     )
 
                 # check gpu usages
@@ -883,6 +917,8 @@ class TaskService:
                         success=False,
                         gpu_model_count=gpu_model_count,
                         clear_verified_job_info=False,
+                        attestation_digest=attestation_digest,
+                        tee_type=tee_type,
                     )
 
                 renting_in_progress = await self.redis_service.renting_in_progress(miner_info.miner_hotkey, executor_info.uuid)
@@ -919,6 +955,8 @@ class TaskService:
                             success=False,
                             gpu_model_count=gpu_model_count,
                             clear_verified_job_info=False,
+                            attestation_digest=attestation_digest,
+                            tee_type=tee_type,
                         )
 
                 # docker_digests = machine_spec.get("docker", {}).get("containers", [])
@@ -968,6 +1006,8 @@ class TaskService:
                             success=False,
                             gpu_model_count=gpu_model_count,
                             clear_verified_job_info=False,
+                            attestation_digest=attestation_digest,
+                            tee_type=tee_type,
                         )
 
                     logger.info(_m("Verifyx validation processed", extra=get_extra_info(default_extra)))
@@ -996,6 +1036,8 @@ class TaskService:
                         success=False,
                         gpu_model_count=gpu_model_count,
                         clear_verified_job_info=False,
+                        attestation_digest=attestation_digest,
+                        tee_type=tee_type,
                     )
 
                 # get available port count from DB (fallback to Redis)
@@ -1058,6 +1100,8 @@ class TaskService:
                     gpu_model_count=gpu_model_count,
                     gpu_uuids=gpu_uuids,
                     sysbox_runtime=sysbox_runtime,
+                    attestation_digest=attestation_digest,
+                    tee_type=tee_type,
                 )
         except Exception as e:
             log_status = "error"
@@ -1092,6 +1136,8 @@ class TaskService:
                 gpu_model=None,
                 gpu_count=0,
                 sysbox_runtime=False,
+                attestation_digest=attestation_digest,
+                tee_type=tee_type,
             )
 
     async def _run_task(

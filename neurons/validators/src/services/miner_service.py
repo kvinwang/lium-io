@@ -48,6 +48,7 @@ from payload_models.payloads import (
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.attestation_service import AttestationService
 from services.docker_service import DockerService
 from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
@@ -66,11 +67,13 @@ class MinerService:
         task_service: Annotated[TaskService, Depends(TaskService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
         port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)],
+        attestation_service: Annotated[AttestationService, Depends(AttestationService)],
     ):
         self.ssh_service = ssh_service
         self.task_service = task_service
         self.redis_service = redis_service
         self.port_mapping_dao = port_mapping_dao
+        self.attestation_service = attestation_service
 
     async def request_job_to_miner(
         self,
@@ -259,6 +262,8 @@ class MinerService:
                         "log_text": result.log_text,
                         "collateral_deposited": result.collateral_deposited,
                         "ssh_pub_keys": result.ssh_pub_keys,
+                        "attestation_digest": result.attestation_digest,
+                        "tee_type": result.tee_type,
                     },
                 )
             except Exception as e:
@@ -327,7 +332,8 @@ class MinerService:
         docker_service = DockerService(
             ssh_service=self.ssh_service,
             redis_service=self.redis_service,
-            port_mapping_dao=self.port_mapping_dao
+            port_mapping_dao=self.port_mapping_dao,
+            attestation_service=self.attestation_service
         )
 
         try:

@@ -37,6 +37,7 @@ from payload_models.payloads import (
 from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info, retry_ssh_command
+from core.db import AsyncSessionMaker
 from daos.port_mapping_dao import PortMappingDao
 from services.const import PREFERRED_POD_PORTS, MIN_PORT_COUNT
 from services.redis_service import (
@@ -89,7 +90,12 @@ class DockerService:
         log_context: dict,
     ) -> Optional[asyncssh.SSHKnownHosts]:
         try:
-            return await self.attestation_service.prepare_host_policy(executor, miner_hotkey)
+            # Create database session for whitelist validation
+            async with AsyncSessionMaker() as db:
+                known_hosts, _, _ = await self.attestation_service.prepare_host_policy(
+                    executor, miner_hotkey, db=db
+                )
+            return known_hosts
         except AttestationError:
             raise
         except Exception as exc:  # pragma: no cover - defensive

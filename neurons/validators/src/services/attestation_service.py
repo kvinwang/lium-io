@@ -1,14 +1,18 @@
 import hashlib
 import logging
-from typing import Optional
+from datetime import datetime
+from typing import Optional, Tuple
 
 import aiohttp
 import asyncssh
+from sqlmodel import select
+from sqlmodel.ext.asyncio.session import AsyncSession
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from models.attestation_whitelist import AttestationWhitelist
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +87,19 @@ class AttestationService:
         except ValueError:
             return None
 
+    async def _check_whitelist(self, db: AsyncSession, tee_type: str, attestation_digest: str) -> bool:
+        """Check if an attestation digest is in the whitelist for the given TEE type."""
+        if not attestation_digest:
+            return False
+
+        statement = select(AttestationWhitelist).where(
+            AttestationWhitelist.tee_type == tee_type,
+            AttestationWhitelist.attestation_digest == attestation_digest,
+            AttestationWhitelist.is_active == True
+        )
+        result = await db.exec(statement)
+        return result.first() is not None
+
     def _validate_verifier_response(self, verifier_payload: dict, expected_report_hex: str, executor: ExecutorSSHInfo) -> None:
         details = verifier_payload.get("details")
         if not isinstance(details, dict):
@@ -111,15 +128,22 @@ class AttestationService:
         self,
         executor: ExecutorSSHInfo,
         miner_hotkey: Optional[str],
-    ) -> Optional[asyncssh.SSHKnownHosts]:
+        db: Optional[AsyncSession] = None,
+    ) -> Tuple[Optional[asyncssh.SSHKnownHosts], Optional[str], Optional[str]]:
         should_verify = self._should_verify(executor)
+        attestation_digest = None
+        tee_type = None
 
         if not executor.ssh_host_key:
             if should_verify:
                 raise AttestationError(
                     f"Executor {executor.address}:{executor.port} missing SSH host key for attestation"
                 )
-            return None
+            return None, None, None
+
+        cached_policy = getattr(executor, "_cached_policy", None)
+        if cached_policy:
+            return cached_policy
 
         if should_verify:
             quote = executor.tdx_quote
@@ -132,6 +156,57 @@ class AttestationService:
             verifier_payload = await self._call_verifier(quote.strip(), executor)
             self._validate_verifier_response(
                 verifier_payload, expected_report, executor)
+
+            # Extract hashes from verifier response and create attestation digest
+            details = verifier_payload.get("details", {})
+            app_info = details.get("app_info", {})
+            os_image_hash = app_info.get("os_image_hash")
+            compose_hash = app_info.get("compose_hash")
+
+            # Create attestation digest by concatenating hashes
+            if os_image_hash and compose_hash:
+                attestation_digest = f"{os_image_hash}{compose_hash}"
+            elif os_image_hash:
+                attestation_digest = os_image_hash
+            else:
+                attestation_digest = None
+
+            # Currently only support dstack/tdx attestation
+            tee_type = "dstack/tdx"
+
+            logger.info(_m(
+                "Attestation verified",
+                extra=get_extra_info({
+                    "executor": f"{executor.address}:{executor.port}",
+                    "attestation_digest": attestation_digest,
+                    "tee_type": tee_type,
+                }),
+            ))
+
+            # Validate with whitelist if database session is provided
+            if db and settings.ENABLE_ATTESTATION_WHITELIST:
+                if not attestation_digest:
+                    raise AttestationError(
+                        f"Missing attestation digest for executor {executor.address}:{executor.port}"
+                    )
+
+                is_whitelisted = await self._check_whitelist(db, tee_type, attestation_digest)
+                if not is_whitelisted:
+                    raise AttestationError(
+                        f"Attestation digest {attestation_digest} with TEE type {tee_type} not in whitelist for executor {executor.address}:{executor.port}"
+                    )
+
+                logger.info(
+                    _m(
+                        "Attestation digest verified against whitelist",
+                        extra=get_extra_info({
+                            "executor": f"{executor.address}:{executor.port}",
+                            "attestation_digest": attestation_digest,
+                            "tee_type": tee_type,
+                        }),
+                    )
+                )
+
             logger.info(
                 _m(
                     "TDX quote verified",
@@ -151,9 +226,10 @@ class AttestationService:
         known_hosts_entry = ",".join(hosts)
 
         try:
-            return asyncssh.import_known_hosts(
+            known_hosts = asyncssh.import_known_hosts(
                 f"{known_hosts_entry} {executor.ssh_host_key.strip()}\n"
             )
+            policy = known_hosts, attestation_digest, tee_type
         except Exception as exc:
             logger.warning(
                 _m(
@@ -166,4 +242,7 @@ class AttestationService:
                     ),
                 )
             )
-            return None
+            policy = None, None, None
+
+        setattr(executor, "_cached_policy", policy)
+        return policy

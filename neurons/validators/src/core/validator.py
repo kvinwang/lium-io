@@ -76,6 +76,7 @@ class Validator:
             task_service=task_service,
             redis_service=self.redis_service,
             port_mapping_dao=self.port_mapping_dao,
+            attestation_service=self.attestation_service,
         )
 
         # init miner_scores

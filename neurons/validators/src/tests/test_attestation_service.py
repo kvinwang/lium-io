@@ -80,5 +80,5 @@ async def test_attestation_service_accepts_fixture_quote(monkeypatch):
         tdx_quote=quote_json,
     )
 
-    policy = await service.prepare_host_policy(executor_info, miner_hotkey=None)
+    policy, digest, _ = await service.prepare_host_policy(executor_info, miner_hotkey=None)
     assert policy is not None
