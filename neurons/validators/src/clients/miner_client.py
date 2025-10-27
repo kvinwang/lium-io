@@ -141,6 +141,8 @@ class MinerClient(abc.ABC):
 
                     async for raw_msg in self.ws:
                         await self.read_messages(raw_msg)
+
+                    await asyncio.sleep(self.sleep_time())
             except (websockets.WebSocketException, OSError) as ex:
                 self.debounce_counter += 1
 
