@@ -36,6 +36,7 @@ from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.collateral_contract_service import CollateralContractService
+from services.attestation_service import AttestationService, AttestationError
 from services.file_encrypt_service import ORIGINAL_KEYS
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,7 @@ class TaskService:
         collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
         executor_connectivity_service: Annotated[ExecutorConnectivityService, Depends(ExecutorConnectivityService)],
         port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)],
+        attestation_service: Annotated[AttestationService, Depends(AttestationService)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
@@ -79,6 +81,7 @@ class TaskService:
 
         self.executor_connectivity_service = executor_connectivity_service
         self.port_mapping_dao = port_mapping_dao
+        self.attestation_service = attestation_service
 
     async def is_script_running(
         self, ssh_client: asyncssh.SSHClientConnection, script_path: str
@@ -415,11 +418,25 @@ class TaskService:
 
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
 
+            try:
+                known_hosts_policy = await self.attestation_service.prepare_host_policy(
+                    executor_info,
+                    miner_info.miner_hotkey,
+                )
+            except AttestationError as exc:
+                log_text = _m(
+                    "Attestation failed",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                )
+                logger.error(log_text)
+                raise
+
             async with InteractiveShellService(
                 host=executor_info.address,
                 username=executor_info.ssh_username,
                 private_key=private_key,
                 port=executor_info.ssh_port,
+                known_hosts=known_hosts_policy,
             ) as shell:
                 # start gpus_utility.py
                 program_id = str(uuid.uuid4())
