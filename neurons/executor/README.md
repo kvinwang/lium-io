@@ -168,24 +168,28 @@ Intel TDX (Trust Domain Extensions) attestation provides hardware-based security
 
 To enable TDX attestation on your executor:
 
-1. Ensure your hardware supports Intel TDX
-2. Install the dstack-sdk (included in dependencies)
+1. Ensure your hardware [supports Intel TDX](https://github.com/canonical/tdx?tab=readme-ov-file#supported-hardware)
+2. Set up the TDX host system following https://github.com/canonical/tdx
 3. Add to your `.env` file:
-```bash
-ENABLE_TDX_ATTESTATION=true
-TDX_QUOTE_TIMEOUT=60
-```
-4. Restart your executor: `docker compose restart`
 
-### Verification
+    ```bash
+    ENABLE_TDX_ATTESTATION=true
+    TDX_QUOTE_TIMEOUT=60
+    ```
 
-To verify TDX is working correctly:
+4. Configure the CVM-specific environment in `neurons/executor/dstacktee/.env` (it differs from the root executor `.env`) by copying the example and adjusting the `CVM_*` values, GPU bindings, and port mappings for your host:
 
-1. Check executor logs for TDX-related messages:
-```bash
-docker compose logs -f
-```
+    ```bash
+    cd neurons/executor/dstacktee
+    cp .env.example .env
+    # edit CVM_VCPUS, CVM_MEMORY, CVM_DISK, CVM_GPUS, RENTING_PORT_RANGE, etc.
+    ```
+     - Note: `RENTING_PORT_RANGE` only supports comma-separated individual ports (e.g., `19001,19002`). Range syntax like `40000-65535` is not supported for CVMs due to the qemu NAT limitation.
 
-2. Look for messages like:
-   - "TDX attestation enabled"
-   - "Generated TDX quote for SSH host key"
+5. Use the CVM helper script to provision and start a TDX-enabled VM:
+
+    ```bash
+    cd neurons/executor/dstacktee
+    ./lium-cvm.sh new my-tdx-cvm
+    ./lium-cvm.sh run my-tdx-cvm
+    ```
